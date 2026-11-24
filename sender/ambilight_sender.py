@@ -2,8 +2,8 @@
 Ambilight sender - screen capture -> edge sampling -> UDP multicast
 
 What it does:
-- Captures the full monitor frame once per cycle (MSS) and slices bands.
-- Computes LED colors from bands, applies blur, tuning, smoothing.
+- Captures the full monitor frame once per cycle (MSS) and slices bands/center.
+- Computes LED colors from bands, applies center blend, blur, tuning, smoothing.
 - Sends UDP multicast packets to the LED controller.
 """
 
@@ -50,6 +50,19 @@ DARK_THRESH = 10
 IGNORE_NEAR_WHITE = True
 WHITE_BRIGHT_THR = 250
 WHITE_CHROMA_THR = 10
+
+# Center blend
+ENABLE_CENTER_BLEND = False
+EDGE_WEIGHT = 0.95
+CENTER_WEIGHT = 0.50
+CENTER_CROP_X = 0.60
+CENTER_CROP_Y = 0.55
+CENTER_EXCLUDE_BOTTOM = 0.18
+
+# Center extra downscale (performance win; usually negligible visually)
+CENTER_DOWNSCALE = 8
+# Compute center every N frames (1 = every frame). Reuses last value between updates.
+CENTER_EVERY_N = 2
 
 # Color tuning
 BRIGHTNESS_KNOB = 0.2
@@ -200,6 +213,13 @@ def pool_bins_vertical(rgb_f_band, w_band, edges):
     sum_w = np.maximum(sum_w, 1.0)[:, None]
     return sum_rgb / sum_w
 
+def compute_center_weighted(center_rgb_u8):
+    rgb_f, w = precompute_rgb_weight(center_rgb_u8)
+    sw = float(w.sum())
+    if sw <= 0.0:
+        return rgb_f.reshape(-1, 3).mean(axis=0, dtype=np.float32)
+    return (rgb_f * w[..., None]).sum(axis=(0, 1)) / sw
+
 # -------------------- color helpers --------------------
 def chroma_boost(rgb01, sat):
     if abs(sat - 1.0) < 1e-6:
@@ -296,6 +316,7 @@ def main():
     # Buffers
     out = np.empty((LED_COUNT, 3), np.float32)
     prev_strip = np.zeros((LED_COUNT, 3), np.float32)
+    center_color = None
 
     seq = 0
     fi = 0
@@ -376,6 +397,27 @@ def main():
                 out[i:i + N_BOTTOM_RIGHT] = br_bins_rgb[::-1]
                 t_asm = time.perf_counter_ns()
 
+                # ---------------- CENTER (blend and/or wiz) ----------------
+                need_center = (ENABLE_CENTER_BLEND and CENTER_WEIGHT > 0.0)
+                if need_center and (CENTER_EVERY_N <= 1 or (fi % CENTER_EVERY_N) == 0 or center_color is None):
+                    cw = max(2, int(W_now * CENTER_CROP_X))
+                    ch = max(2, int(H_now * CENTER_CROP_Y))
+                    x0c = (W_now - cw) // 2
+                    x1c = x0c + cw
+                    usable_h = max(2, H_now - int(H_now * CENTER_EXCLUDE_BOTTOM))
+                    y0c = max(0, (usable_h - ch) // 2)
+                    y1c = min(usable_h, y0c + ch)
+
+                    center_rgb = rgb[y0c:y1c, x0c:x1c, :]
+                    if CENTER_DOWNSCALE > 1:
+                        center_rgb = center_rgb[::CENTER_DOWNSCALE, ::CENTER_DOWNSCALE, :]
+
+                    center_color = compute_center_weighted(center_rgb)
+
+                if need_center and (center_color is not None) and ENABLE_CENTER_BLEND and CENTER_WEIGHT > 0.0:
+                    out[:] = (EDGE_WEIGHT * out) + (CENTER_WEIGHT * center_color[None, :])
+                t_ctr = time.perf_counter_ns()
+
                 # ---------------- BLUR ----------------
                 apply_spatial_blur_per_segment(out)
                 t_blur = time.perf_counter_ns()
@@ -414,14 +456,15 @@ def main():
                     pre_ms  = (t_pre - t_slice) / 1e6
                     pool_ms = (t_pool - t_pre) / 1e6
                     asm_ms  = (t_asm - t_pool) / 1e6
-                    blur_ms = (t_blur - t_asm) / 1e6
+                    ctr_ms  = (t_ctr - t_asm) / 1e6
+                    blur_ms = (t_blur - t_ctr) / 1e6
                     tune_ms = (t_tune - t_blur) / 1e6
                     sm_ms   = (t_sm - t_tune) / 1e6
                     send_ms = (t_sent - t_sm) / 1e6
 
                     dbg(f"[timing] seq={seq:05d} t_send_us={t_send_us:10d} loop={loop_ms:7.2f}ms")
                     dbg(f"[step]  cap={cap_ms:6.2f} ds={ds_ms:6.2f} slice={slice_ms:6.2f} | "
-                        f"pre={pre_ms:6.2f} pool={pool_ms:6.2f} asm={asm_ms:6.2f} | "
+                        f"pre={pre_ms:6.2f} pool={pool_ms:6.2f} asm={asm_ms:6.2f} ctr={ctr_ms:6.2f} | "
                         f"blur={blur_ms:6.2f} tune={tune_ms:6.2f} smth={sm_ms:6.2f} send={send_ms:6.2f}")
 
                 if DEBUG and (fi % LOG_EVERY == 0):
