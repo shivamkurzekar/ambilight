@@ -4,10 +4,10 @@ Ambilight sender - screen capture -> edge sampling -> UDP multicast
 What it does:
 - Captures the full monitor frame once per cycle (MSS) and slices bands/center.
 - Computes LED colors from bands, applies center blend, blur, tuning, smoothing.
-- Sends UDP multicast packets to the LED controller.
+- Sends UDP multicast packets to the LED controller (and optional WiZ bulb).
 """
 
-import socket, struct, time, ctypes
+import socket, struct, time, json, ctypes
 from ctypes import wintypes
 import numpy as np
 import mss
@@ -76,6 +76,16 @@ SMOOTH_ALPHA = 0.08
 # Spatial blur
 SPATIAL_BLUR_RADIUS = 0
 SPATIAL_BLUR_PASSES = 1
+
+# WiZ bulb sync
+ENABLE_WIZ_wiz = False
+BULB_IP_wiz = _cfg("BULB_IP", "192.168.0.100")
+BULB_PORT_wiz = _cfg("BULB_PORT", 38899)
+BULB_FPS_wiz = 5.0
+BULB_SMOOTH_ALPHA_wiz = 0.12
+BULB_DELTA_THR_wiz = 20
+BULB_BRIGHTNESS_KNOB_wiz = 1.00
+BULB_SOURCE_wiz = "center"  # "center" or "avg_leds"
 
 # DEBUG = True
 DEBUG = False
@@ -268,6 +278,17 @@ def apply_spatial_blur_per_segment(out):
     spatial_blur_segment(out, s, N_RIGHT);        s += N_RIGHT
     spatial_blur_segment(out, s, N_BOTTOM_RIGHT)
 
+# ------------------- WiZ helpers -------------------
+def wiz_send_state_wiz(sock_wiz, r, g, b):
+    payload = {"method": "setState", "params": {"state": True, "r": int(r), "g": int(g), "b": int(b)}}
+    sock_wiz.sendto(json.dumps(payload).encode("utf-8"), (BULB_IP_wiz, BULB_PORT_wiz))
+
+def wiz_should_send_wiz(prev_rgb_u8, new_rgb_u8):
+    dr = abs(int(new_rgb_u8[0]) - int(prev_rgb_u8[0]))
+    dg = abs(int(new_rgb_u8[1]) - int(prev_rgb_u8[1]))
+    db = abs(int(new_rgb_u8[2]) - int(prev_rgb_u8[2]))
+    return (dr + dg + db) >= BULB_DELTA_THR_wiz
+
 # ------------------- MSS capture helpers -------------------
 def mss_grab_bgra(sct: mss.mss, rect: dict):
     return sct.grab(rect)
@@ -312,6 +333,14 @@ def main():
     # UDP sockets
     sock_strip = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock_strip.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+    sock_wiz = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) if ENABLE_WIZ_wiz else None
+
+    if ENABLE_WIZ_wiz:
+        dbg(f"[wiz] enabled ip={BULB_IP_wiz}:{BULB_PORT_wiz} fps={BULB_FPS_wiz} alpha={BULB_SMOOTH_ALPHA_wiz} src={BULB_SOURCE_wiz}")
+        try:
+            wiz_send_state_wiz(sock_wiz, 255, 255, 255)
+        except Exception as e:
+            dbg(f"[wiz] WARN init failed: {e}")
 
     # Buffers
     out = np.empty((LED_COUNT, 3), np.float32)
@@ -321,6 +350,10 @@ def main():
     seq = 0
     fi = 0
     dt = 1.0 / TARGET_FPS if TARGET_FPS > 0 else 0.0
+
+    wiz_next_send_t = 0.0
+    wiz_prev_rgb_u8 = np.array([0, 0, 0], dtype=np.uint8)
+    wiz_prev_f32 = np.zeros(3, dtype=np.float32)
 
     mon = {"left": mon_left, "top": mon_top, "width": mon_w, "height": mon_h}
 
@@ -398,7 +431,7 @@ def main():
                 t_asm = time.perf_counter_ns()
 
                 # ---------------- CENTER (blend and/or wiz) ----------------
-                need_center = (ENABLE_CENTER_BLEND and CENTER_WEIGHT > 0.0)
+                need_center = (ENABLE_CENTER_BLEND and CENTER_WEIGHT > 0.0) or (ENABLE_WIZ_wiz and BULB_SOURCE_wiz == "center")
                 if need_center and (CENTER_EVERY_N <= 1 or (fi % CENTER_EVERY_N) == 0 or center_color is None):
                     cw = max(2, int(W_now * CENTER_CROP_X))
                     ch = max(2, int(H_now * CENTER_CROP_Y))
@@ -447,6 +480,34 @@ def main():
                 sock_strip.sendto(pkt, (MCAST_GRP, PORT))
                 t_sent = time.perf_counter_ns()
 
+                # ---------------- WIZ ----------------
+                t_wiz0 = time.perf_counter_ns()
+                now = time.perf_counter()
+                if ENABLE_WIZ_wiz and sock_wiz is not None and now >= wiz_next_send_t:
+                    wiz_next_send_t = now + (1.0 / max(0.1, BULB_FPS_wiz))
+
+                    if BULB_SOURCE_wiz == "avg_leds":
+                        src = rgb_u8.mean(axis=0).astype(np.float32)
+                    else:
+                        if center_color is not None:
+                            src = center_color.astype(np.float32)
+                        else:
+                            src = rgb_u8.mean(axis=0).astype(np.float32)
+
+                    src01 = np.clip((src / 255.0) * BULB_BRIGHTNESS_KNOB_wiz, 0.0, 1.0)
+                    src = src01 * 255.0
+
+                    wiz_prev_f32[:] = (1.0 - BULB_SMOOTH_ALPHA_wiz) * wiz_prev_f32 + BULB_SMOOTH_ALPHA_wiz * src
+                    wiz_rgb_u8 = np.clip(wiz_prev_f32 + 0.5, 0, 255).astype(np.uint8)
+
+                    if wiz_should_send_wiz(wiz_prev_rgb_u8, wiz_rgb_u8):
+                        try:
+                            wiz_send_state_wiz(sock_wiz, int(wiz_rgb_u8[0]), int(wiz_rgb_u8[1]), int(wiz_rgb_u8[2]))
+                            wiz_prev_rgb_u8 = wiz_rgb_u8.copy()
+                        except Exception as e:
+                            dbg(f"[wiz] WARN send failed: {e}")
+                t_wiz1 = time.perf_counter_ns()
+
                 # ---------------- LOGS ----------------
                 if DEBUG and (seq % TIMING_EVERY_SEQ == 0):
                     loop_ms = (t_sent - t0) / 1e6
@@ -461,11 +522,13 @@ def main():
                     tune_ms = (t_tune - t_blur) / 1e6
                     sm_ms   = (t_sm - t_tune) / 1e6
                     send_ms = (t_sent - t_sm) / 1e6
+                    wiz_ms  = (t_wiz1 - t_wiz0) / 1e6
 
                     dbg(f"[timing] seq={seq:05d} t_send_us={t_send_us:10d} loop={loop_ms:7.2f}ms")
                     dbg(f"[step]  cap={cap_ms:6.2f} ds={ds_ms:6.2f} slice={slice_ms:6.2f} | "
                         f"pre={pre_ms:6.2f} pool={pool_ms:6.2f} asm={asm_ms:6.2f} ctr={ctr_ms:6.2f} | "
-                        f"blur={blur_ms:6.2f} tune={tune_ms:6.2f} smth={sm_ms:6.2f} send={send_ms:6.2f}")
+                        f"blur={blur_ms:6.2f} tune={tune_ms:6.2f} smth={sm_ms:6.2f} send={send_ms:6.2f} "
+                        f"wiz={wiz_ms:6.2f}")
 
                 if DEBUG and (fi % LOG_EVERY == 0):
                     led0 = tuple(int(x) for x in rgb_u8[0])
@@ -484,6 +547,12 @@ def main():
 
     except KeyboardInterrupt:
         dbg("\n[main] Stopped")
+    finally:
+        try:
+            if sock_wiz:
+                sock_wiz.close()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
