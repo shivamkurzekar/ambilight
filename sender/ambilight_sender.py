@@ -30,6 +30,8 @@ PORT = _cfg("PORT", 7777)
 LED_COUNT = 107
 
 TARGET_FPS = 30
+TIMING_EVERY_SEQ = 5
+LOG_EVERY = 30
 
 # Monitor selection policy:
 #   "external_largest" -> largest NON-primary (usually external in extend)
@@ -245,17 +247,21 @@ def main():
                 t0 = time.perf_counter_ns()
 
                 # ---------------- CAPTURE (single full grab) ----------------
+                t_cap0 = time.perf_counter_ns()
                 shot = mss_grab_bgra(sct, mon)
                 img = np.frombuffer(shot.raw, dtype=np.uint8).reshape((shot.height, shot.width, 4))
+                t_cap1 = time.perf_counter_ns()
 
                 bgr = img[..., :3]
                 rgb_full = bgr[..., ::-1]
+                t_cap = t_cap1
 
                 # ---------------- DOWNSCALE (cheap slicing) ----------------
                 if ds > 1:
                     rgb = rgb_full[::ds, ::ds, :]
                 else:
                     rgb = rgb_full
+                t_ds = time.perf_counter_ns()
 
                 # ---------------- SLICE bands from full frame ----------------
                 H_now, W_now = rgb.shape[:2]
@@ -269,12 +275,14 @@ def main():
                 left_rgb = rgb[:, 0:band_eff, :]
                 right_rgb = rgb[:, max(0, W_now - band_eff):W_now, :]
                 bottom_rgb = rgb[y0:y1, :, :]
+                t_slice = time.perf_counter_ns()
 
                 # ---------------- PRECOMPUTE (bands only) ----------------
                 top_f, top_w = precompute_rgb_weight(top_rgb)
                 left_f, left_w = precompute_rgb_weight(left_rgb)
                 right_f, right_w = precompute_rgb_weight(right_rgb)
                 bot_f, bot_w = precompute_rgb_weight(bottom_rgb)
+                t_pre = time.perf_counter_ns()
 
                 if (W_now != W_eff) or (H_now != H_eff):
                     W_eff = W_now
@@ -295,6 +303,7 @@ def main():
 
                 bl_bins_rgb = pool_bins_horizontal(bot_f[:, :bl_w_end, :], bot_w[:, :bl_w_end], edges_bl)
                 br_bins_rgb = pool_bins_horizontal(bot_f[:, br_x0:, :], bot_w[:, br_x0:], edges_br)
+                t_pool = time.perf_counter_ns()
 
                 # ---------------- ASSEMBLE ----------------
                 i = 0
@@ -303,12 +312,36 @@ def main():
                 out[i:i + N_TOP] = top_bins_rgb; i += N_TOP
                 out[i:i + N_RIGHT] = right_bins_rgb; i += N_RIGHT
                 out[i:i + N_BOTTOM_RIGHT] = br_bins_rgb[::-1]
+                t_asm = time.perf_counter_ns()
 
                 rgb_u8 = np.clip(out + 0.5, 0, 255).astype(np.uint8)
 
                 # ---------------- SEND STRIP ----------------
                 pkt, t_send_us = pack_frame_v2(seq, rgb_u8)
                 sock_strip.sendto(pkt, (MCAST_GRP, PORT))
+                t_sent = time.perf_counter_ns()
+
+                # ---------------- LOGS ----------------
+                if DEBUG and (seq % TIMING_EVERY_SEQ == 0):
+                    loop_ms = (t_sent - t0) / 1e6
+                    cap_ms  = (t_cap1 - t_cap0) / 1e6
+                    ds_ms   = (t_ds - t_cap1) / 1e6
+                    slice_ms = (t_slice - t_ds) / 1e6
+                    pre_ms  = (t_pre - t_slice) / 1e6
+                    pool_ms = (t_pool - t_pre) / 1e6
+                    asm_ms  = (t_asm - t_pool) / 1e6
+                    send_ms = (t_sent - t_asm) / 1e6
+
+                    dbg(f"[timing] seq={seq:05d} t_send_us={t_send_us:10d} loop={loop_ms:7.2f}ms")
+                    dbg(f"[step]  cap={cap_ms:6.2f} ds={ds_ms:6.2f} slice={slice_ms:6.2f} | "
+                        f"pre={pre_ms:6.2f} pool={pool_ms:6.2f} asm={asm_ms:6.2f} | "
+                        f"send={send_ms:6.2f}")
+
+                if DEBUG and (fi % LOG_EVERY == 0):
+                    led0 = tuple(int(x) for x in rgb_u8[0])
+                    top_mid = tuple(int(x) for x in rgb_u8[N_BOTTOM_LEFT + N_LEFT + (N_TOP // 2)])
+                    last = tuple(int(x) for x in rgb_u8[-1])
+                    dbg(f"[strip] f={fi:06d} seq={seq:05d} led0={led0} topMid={top_mid} last={last}")
 
                 seq = (seq + 1) & 0xFFFF
                 fi += 1
