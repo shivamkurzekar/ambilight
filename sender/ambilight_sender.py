@@ -3,7 +3,7 @@ Ambilight sender - screen capture -> edge sampling -> UDP multicast
 
 What it does:
 - Captures the full monitor frame once per cycle (MSS) and slices bands.
-- Computes LED colors from bands.
+- Computes LED colors from bands, applies blur, tuning, smoothing.
 - Sends UDP multicast packets to the LED controller.
 """
 
@@ -50,6 +50,19 @@ DARK_THRESH = 10
 IGNORE_NEAR_WHITE = True
 WHITE_BRIGHT_THR = 250
 WHITE_CHROMA_THR = 10
+
+# Color tuning
+BRIGHTNESS_KNOB = 0.2
+SAT_BOOST = 1.15
+WARMTH = 0.10
+CHANNEL_CLIP = 255
+
+# Temporal smoothing
+SMOOTH_ALPHA = 0.08
+
+# Spatial blur
+SPATIAL_BLUR_RADIUS = 0
+SPATIAL_BLUR_PASSES = 1
 
 # DEBUG = True
 DEBUG = False
@@ -187,6 +200,54 @@ def pool_bins_vertical(rgb_f_band, w_band, edges):
     sum_w = np.maximum(sum_w, 1.0)[:, None]
     return sum_rgb / sum_w
 
+# -------------------- color helpers --------------------
+def chroma_boost(rgb01, sat):
+    if abs(sat - 1.0) < 1e-6:
+        return rgb01
+    gray = (0.299 * rgb01[..., 0] + 0.587 * rgb01[..., 1] + 0.114 * rgb01[..., 2])[..., None]
+    return np.clip(gray + (rgb01 - gray) * sat, 0.0, 1.0)
+
+def apply_warmth(rgb01, warmth):
+    if abs(warmth) < 1e-6:
+        return rgb01
+    out = rgb01.copy()
+    out[..., 0] *= (1.0 + 0.60 * warmth)
+    out[..., 1] *= (1.0 + 0.10 * warmth)
+    out[..., 2] *= (1.0 - 0.60 * warmth)
+    return np.clip(out, 0.0, 1.0)
+
+# -------------------- spatial blur --------------------
+def spatial_blur_segment(arr, start, count):
+    if SPATIAL_BLUR_RADIUS <= 0 or count < 3:
+        return
+
+    if SPATIAL_BLUR_RADIUS == 1:
+        w = np.array([1, 2, 1], np.float32); r = 1
+    elif SPATIAL_BLUR_RADIUS == 2:
+        w = np.array([1, 2, 3, 2, 1], np.float32); r = 2
+    else:
+        w = np.array([1, 2, 3, 4, 3, 2, 1], np.float32); r = 3
+    w /= w.sum()
+
+    seg = arr[start:start + count].copy()
+    for _ in range(SPATIAL_BLUR_PASSES):
+        tmp = seg.copy()
+        for i in range(count):
+            acc = np.zeros(3, np.float32)
+            for k, wk in enumerate(w):
+                j = min(max(i + k - r, 0), count - 1)
+                acc += tmp[j] * wk
+            seg[i] = acc
+    arr[start:start + count] = seg
+
+def apply_spatial_blur_per_segment(out):
+    s = 0
+    spatial_blur_segment(out, s, N_BOTTOM_LEFT);  s += N_BOTTOM_LEFT
+    spatial_blur_segment(out, s, N_LEFT);         s += N_LEFT
+    spatial_blur_segment(out, s, N_TOP);          s += N_TOP
+    spatial_blur_segment(out, s, N_RIGHT);        s += N_RIGHT
+    spatial_blur_segment(out, s, N_BOTTOM_RIGHT)
+
 # ------------------- MSS capture helpers -------------------
 def mss_grab_bgra(sct: mss.mss, rect: dict):
     return sct.grab(rect)
@@ -234,6 +295,7 @@ def main():
 
     # Buffers
     out = np.empty((LED_COUNT, 3), np.float32)
+    prev_strip = np.zeros((LED_COUNT, 3), np.float32)
 
     seq = 0
     fi = 0
@@ -314,7 +376,29 @@ def main():
                 out[i:i + N_BOTTOM_RIGHT] = br_bins_rgb[::-1]
                 t_asm = time.perf_counter_ns()
 
-                rgb_u8 = np.clip(out + 0.5, 0, 255).astype(np.uint8)
+                # ---------------- BLUR ----------------
+                apply_spatial_blur_per_segment(out)
+                t_blur = time.perf_counter_ns()
+
+                # ---------------- TUNE ----------------
+                rgb01 = np.clip(out / 255.0, 0.0, 1.0)
+                rgb01 = np.clip(rgb01 * BRIGHTNESS_KNOB, 0.0, 1.0)
+                rgb01 = chroma_boost(rgb01, SAT_BOOST)
+                rgb01 = apply_warmth(rgb01, WARMTH)
+                out[:] = rgb01 * 255.0
+                if CHANNEL_CLIP < 255:
+                    np.minimum(out, float(CHANNEL_CLIP), out=out)
+                t_tune = time.perf_counter_ns()
+
+                # ---------------- SMOOTH ----------------
+                if SMOOTH_ALPHA > 0:
+                    prev_strip[:] = (1.0 - SMOOTH_ALPHA) * prev_strip + SMOOTH_ALPHA * out
+                    out_s = prev_strip
+                else:
+                    out_s = out
+
+                rgb_u8 = np.clip(out_s + 0.5, 0, 255).astype(np.uint8)
+                t_sm = time.perf_counter_ns()
 
                 # ---------------- SEND STRIP ----------------
                 pkt, t_send_us = pack_frame_v2(seq, rgb_u8)
@@ -330,12 +414,15 @@ def main():
                     pre_ms  = (t_pre - t_slice) / 1e6
                     pool_ms = (t_pool - t_pre) / 1e6
                     asm_ms  = (t_asm - t_pool) / 1e6
-                    send_ms = (t_sent - t_asm) / 1e6
+                    blur_ms = (t_blur - t_asm) / 1e6
+                    tune_ms = (t_tune - t_blur) / 1e6
+                    sm_ms   = (t_sm - t_tune) / 1e6
+                    send_ms = (t_sent - t_sm) / 1e6
 
                     dbg(f"[timing] seq={seq:05d} t_send_us={t_send_us:10d} loop={loop_ms:7.2f}ms")
                     dbg(f"[step]  cap={cap_ms:6.2f} ds={ds_ms:6.2f} slice={slice_ms:6.2f} | "
                         f"pre={pre_ms:6.2f} pool={pool_ms:6.2f} asm={asm_ms:6.2f} | "
-                        f"send={send_ms:6.2f}")
+                        f"blur={blur_ms:6.2f} tune={tune_ms:6.2f} smth={sm_ms:6.2f} send={send_ms:6.2f}")
 
                 if DEBUG and (fi % LOG_EVERY == 0):
                     led0 = tuple(int(x) for x in rgb_u8[0])
