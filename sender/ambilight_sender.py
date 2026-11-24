@@ -1,13 +1,14 @@
 """
-Ambilight sender - screen capture -> edge sampling -> UDP multicast
+Ambilight sender - single-grab capture + pipelined processing + optional fast paths
 
 What it does:
 - Captures the full monitor frame once per cycle (MSS) and slices bands/center.
+- Runs capture in a background thread so processing and capture overlap.
 - Computes LED colors from bands, applies center blend, blur, tuning, smoothing.
 - Sends UDP multicast packets to the LED controller (and optional WiZ bulb).
 """
 
-import socket, struct, time, json, ctypes
+import socket, struct, time, json, gc, ctypes, threading
 from ctypes import wintypes
 import numpy as np
 import mss
@@ -33,11 +34,18 @@ TARGET_FPS = 30
 TIMING_EVERY_SEQ = 5
 LOG_EVERY = 30
 
+# Force GC every N frames
+GC_EVERY_N_FRAMES = 240
+
 # Monitor selection policy:
 #   "external_largest" -> largest NON-primary (usually external in extend)
 #   "primary"          -> primary monitor
 #   "largest"          -> largest monitor regardless of primary
 MONITOR_PICK_MODE = "external_largest"
+
+# Capture pipeline
+USE_CAPTURE_THREAD = True
+CAPTURE_WAIT_TIMEOUT_S = 0.5
 
 # Sampling
 DOWNSCALE = 4                 # applied via slicing [::DOWNSCALE]
@@ -63,6 +71,9 @@ CENTER_EXCLUDE_BOTTOM = 0.18
 CENTER_DOWNSCALE = 8
 # Compute center every N frames (1 = every frame). Reuses last value between updates.
 CENTER_EVERY_N = 2
+
+# Optional faster path (less accurate color weighting)
+FAST_WEIGHTS = False
 
 # Color tuning
 BRIGHTNESS_KNOB = 0.2
@@ -223,12 +234,31 @@ def pool_bins_vertical(rgb_f_band, w_band, edges):
     sum_w = np.maximum(sum_w, 1.0)[:, None]
     return sum_rgb / sum_w
 
+def pool_bins_horizontal_fast(rgb_u8, edges):
+    col_rgb = rgb_u8.astype(np.float32, copy=False).mean(axis=0)
+    starts = edges[:-1]
+    sum_rgb = np.add.reduceat(col_rgb, starts, axis=0)
+    counts = (edges[1:] - edges[:-1]).astype(np.float32)[:, None]
+    counts = np.maximum(counts, 1.0)
+    return sum_rgb / counts
+
+def pool_bins_vertical_fast(rgb_u8, edges):
+    row_rgb = rgb_u8.astype(np.float32, copy=False).mean(axis=1)
+    starts = edges[:-1]
+    sum_rgb = np.add.reduceat(row_rgb, starts, axis=0)
+    counts = (edges[1:] - edges[:-1]).astype(np.float32)[:, None]
+    counts = np.maximum(counts, 1.0)
+    return sum_rgb / counts
+
 def compute_center_weighted(center_rgb_u8):
     rgb_f, w = precompute_rgb_weight(center_rgb_u8)
     sw = float(w.sum())
     if sw <= 0.0:
         return rgb_f.reshape(-1, 3).mean(axis=0, dtype=np.float32)
     return (rgb_f * w[..., None]).sum(axis=(0, 1)) / sw
+
+def compute_center_fast(center_rgb_u8):
+    return center_rgb_u8.astype(np.float32, copy=False).mean(axis=(0, 1))
 
 # -------------------- color helpers --------------------
 def chroma_boost(rgb01, sat):
@@ -293,6 +323,51 @@ def wiz_should_send_wiz(prev_rgb_u8, new_rgb_u8):
 def mss_grab_bgra(sct: mss.mss, rect: dict):
     return sct.grab(rect)
 
+class CaptureThread:
+    def __init__(self, mon):
+        self.mon = mon
+        self.lock = threading.Lock()
+        self.new_frame = threading.Event()
+        self.stop = threading.Event()
+        self.raw = None
+        self.width = 0
+        self.height = 0
+        self.seq = 0
+        self.thread = threading.Thread(target=self._loop, name="cap", daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def close(self):
+        self.stop.set()
+        self.new_frame.set()
+        self.thread.join(timeout=1.0)
+
+    def _loop(self):
+        with mss.mss() as sct:
+            while not self.stop.is_set():
+                try:
+                    shot = mss_grab_bgra(sct, self.mon)
+                except Exception:
+                    time.sleep(0.01)
+                    continue
+                with self.lock:
+                    self.raw = shot.raw
+                    self.width = shot.width
+                    self.height = shot.height
+                    self.seq = (self.seq + 1) & 0xFFFFFFFF
+                self.new_frame.set()
+
+    def get_latest(self, timeout_s):
+        if not self.new_frame.wait(timeout=timeout_s):
+            return None, None, None
+        with self.lock:
+            raw = self.raw
+            w = self.width
+            h = self.height
+        self.new_frame.clear()
+        return raw, w, h
+
 # ------------------- main -------------------
 def main():
     # pick monitor (virtual coords, can be negative)
@@ -329,6 +404,8 @@ def main():
     edges_br = split_edges(max(1, W_eff - (cx_eff + skip_eff)), N_BOTTOM_RIGHT)
 
     dbg(f"[strip] sampling(eff)={W_eff}x{H_eff} band_eff={band_eff} skip_eff={skip_eff} yoff_eff={yoff_eff} hdr=v{VERSION}")
+    dbg(f"[strip] capture full-frame (single grab) ds={ds} thread={USE_CAPTURE_THREAD}")
+    dbg(f"[strip] centerEvery={CENTER_EVERY_N} fastWeights={FAST_WEIGHTS}")
 
     # UDP sockets
     sock_strip = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
@@ -356,6 +433,10 @@ def main():
     wiz_prev_f32 = np.zeros(3, dtype=np.float32)
 
     mon = {"left": mon_left, "top": mon_top, "width": mon_w, "height": mon_h}
+    cap_thread = CaptureThread(mon) if USE_CAPTURE_THREAD else None
+    if cap_thread:
+        cap_thread.start()
+        time.sleep(0.05)
 
     try:
         with mss.mss() as sct:
@@ -364,8 +445,14 @@ def main():
 
                 # ---------------- CAPTURE (single full grab) ----------------
                 t_cap0 = time.perf_counter_ns()
-                shot = mss_grab_bgra(sct, mon)
-                img = np.frombuffer(shot.raw, dtype=np.uint8).reshape((shot.height, shot.width, 4))
+                if cap_thread:
+                    raw, w, h = cap_thread.get_latest(CAPTURE_WAIT_TIMEOUT_S)
+                    if raw is None:
+                        continue
+                    img = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 4))
+                else:
+                    shot = mss_grab_bgra(sct, mon)
+                    img = np.frombuffer(shot.raw, dtype=np.uint8).reshape((shot.height, shot.width, 4))
                 t_cap1 = time.perf_counter_ns()
 
                 bgr = img[..., :3]
@@ -394,32 +481,45 @@ def main():
                 t_slice = time.perf_counter_ns()
 
                 # ---------------- PRECOMPUTE (bands only) ----------------
-                top_f, top_w = precompute_rgb_weight(top_rgb)
-                left_f, left_w = precompute_rgb_weight(left_rgb)
-                right_f, right_w = precompute_rgb_weight(right_rgb)
-                bot_f, bot_w = precompute_rgb_weight(bottom_rgb)
-                t_pre = time.perf_counter_ns()
+                if FAST_WEIGHTS:
+                    top_bins_rgb = pool_bins_horizontal_fast(top_rgb, edges_top)
+                    left_bins_rgb = pool_bins_vertical_fast(left_rgb, edges_left)
+                    right_bins_rgb = pool_bins_vertical_fast(right_rgb, edges_right)
 
-                if (W_now != W_eff) or (H_now != H_eff):
-                    W_eff = W_now
-                    H_eff = H_now
-                    cx_eff = W_eff // 2
-                    edges_top = split_edges(W_eff, N_TOP)
-                    edges_left = split_edges(H_eff, N_LEFT)
-                    edges_right = split_edges(H_eff, N_RIGHT)
-                    edges_bl = split_edges(max(1, cx_eff - skip_eff), N_BOTTOM_LEFT)
-                    edges_br = split_edges(max(1, W_eff - (cx_eff + skip_eff)), N_BOTTOM_RIGHT)
+                    bl_w_end = max(1, cx_eff - skip_eff)
+                    br_x0 = min(W_eff - 1, cx_eff + skip_eff)
 
-                top_bins_rgb = pool_bins_horizontal(top_f, top_w, edges_top)
-                left_bins_rgb = pool_bins_vertical(left_f, left_w, edges_left)
-                right_bins_rgb = pool_bins_vertical(right_f, right_w, edges_right)
+                    bl_bins_rgb = pool_bins_horizontal_fast(bottom_rgb[:, :bl_w_end, :], edges_bl)
+                    br_bins_rgb = pool_bins_horizontal_fast(bottom_rgb[:, br_x0:, :], edges_br)
+                    t_pre = t_slice
+                    t_pool = time.perf_counter_ns()
+                else:
+                    top_f, top_w = precompute_rgb_weight(top_rgb)
+                    left_f, left_w = precompute_rgb_weight(left_rgb)
+                    right_f, right_w = precompute_rgb_weight(right_rgb)
+                    bot_f, bot_w = precompute_rgb_weight(bottom_rgb)
+                    t_pre = time.perf_counter_ns()
 
-                bl_w_end = max(1, cx_eff - skip_eff)
-                br_x0 = min(W_eff - 1, cx_eff + skip_eff)
+                    if (W_now != W_eff) or (H_now != H_eff):
+                        W_eff = W_now
+                        H_eff = H_now
+                        cx_eff = W_eff // 2
+                        edges_top = split_edges(W_eff, N_TOP)
+                        edges_left = split_edges(H_eff, N_LEFT)
+                        edges_right = split_edges(H_eff, N_RIGHT)
+                        edges_bl = split_edges(max(1, cx_eff - skip_eff), N_BOTTOM_LEFT)
+                        edges_br = split_edges(max(1, W_eff - (cx_eff + skip_eff)), N_BOTTOM_RIGHT)
 
-                bl_bins_rgb = pool_bins_horizontal(bot_f[:, :bl_w_end, :], bot_w[:, :bl_w_end], edges_bl)
-                br_bins_rgb = pool_bins_horizontal(bot_f[:, br_x0:, :], bot_w[:, br_x0:], edges_br)
-                t_pool = time.perf_counter_ns()
+                    top_bins_rgb = pool_bins_horizontal(top_f, top_w, edges_top)
+                    left_bins_rgb = pool_bins_vertical(left_f, left_w, edges_left)
+                    right_bins_rgb = pool_bins_vertical(right_f, right_w, edges_right)
+
+                    bl_w_end = max(1, cx_eff - skip_eff)
+                    br_x0 = min(W_eff - 1, cx_eff + skip_eff)
+
+                    bl_bins_rgb = pool_bins_horizontal(bot_f[:, :bl_w_end, :], bot_w[:, :bl_w_end], edges_bl)
+                    br_bins_rgb = pool_bins_horizontal(bot_f[:, br_x0:, :], bot_w[:, br_x0:], edges_br)
+                    t_pool = time.perf_counter_ns()
 
                 # ---------------- ASSEMBLE ----------------
                 i = 0
@@ -445,7 +545,10 @@ def main():
                     if CENTER_DOWNSCALE > 1:
                         center_rgb = center_rgb[::CENTER_DOWNSCALE, ::CENTER_DOWNSCALE, :]
 
-                    center_color = compute_center_weighted(center_rgb)
+                    if FAST_WEIGHTS:
+                        center_color = compute_center_fast(center_rgb)
+                    else:
+                        center_color = compute_center_weighted(center_rgb)
 
                 if need_center and (center_color is not None) and ENABLE_CENTER_BLEND and CENTER_WEIGHT > 0.0:
                     out[:] = (EDGE_WEIGHT * out) + (CENTER_WEIGHT * center_color[None, :])
@@ -508,6 +611,12 @@ def main():
                             dbg(f"[wiz] WARN send failed: {e}")
                 t_wiz1 = time.perf_counter_ns()
 
+                # ---------------- GC ----------------
+                t_gc0 = time.perf_counter_ns()
+                if GC_EVERY_N_FRAMES and (fi % GC_EVERY_N_FRAMES == 0):
+                    gc.collect()
+                t_gc1 = time.perf_counter_ns()
+
                 # ---------------- LOGS ----------------
                 if DEBUG and (seq % TIMING_EVERY_SEQ == 0):
                     loop_ms = (t_sent - t0) / 1e6
@@ -523,12 +632,13 @@ def main():
                     sm_ms   = (t_sm - t_tune) / 1e6
                     send_ms = (t_sent - t_sm) / 1e6
                     wiz_ms  = (t_wiz1 - t_wiz0) / 1e6
+                    gc_ms   = (t_gc1 - t_gc0) / 1e6
 
                     dbg(f"[timing] seq={seq:05d} t_send_us={t_send_us:10d} loop={loop_ms:7.2f}ms")
                     dbg(f"[step]  cap={cap_ms:6.2f} ds={ds_ms:6.2f} slice={slice_ms:6.2f} | "
                         f"pre={pre_ms:6.2f} pool={pool_ms:6.2f} asm={asm_ms:6.2f} ctr={ctr_ms:6.2f} | "
                         f"blur={blur_ms:6.2f} tune={tune_ms:6.2f} smth={sm_ms:6.2f} send={send_ms:6.2f} "
-                        f"wiz={wiz_ms:6.2f}")
+                        f"wiz={wiz_ms:6.2f} gc={gc_ms:6.2f}")
 
                 if DEBUG and (fi % LOG_EVERY == 0):
                     led0 = tuple(int(x) for x in rgb_u8[0])
@@ -549,6 +659,8 @@ def main():
         dbg("\n[main] Stopped")
     finally:
         try:
+            if cap_thread:
+                cap_thread.close()
             if sock_wiz:
                 sock_wiz.close()
         except Exception:
