@@ -1,0 +1,19 @@
+# ---- Local secrets / machine-specific config (NEVER commit) ----
+# Copy the *.example files and fill in your own values.
+secrets.h
+config_local.py
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ---- Arduino build output ----
+build/
+
+# ---- Editors / OS ----
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
